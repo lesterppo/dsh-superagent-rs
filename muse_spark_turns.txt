@@ -1,0 +1,15 @@
+Reading the file first to confirm the typo.
+```tool
+{"name": "read_file", "arguments": {"path": "README.md"}}
+```
+<<<END>>>
+Confirmed: Wrold. Fixing it now.
+```tool
+{"name": "write_file", "arguments": {"path": "README.md", "content": "Hello World\n"}}
+```
+<<<END>>>
+Fixed. Reporting ready.
+```tool
+{"name": "report", "arguments": {"state": "ready", "summary": "Fixed typo Wrold->World in README.md"}}
+```
+<<<END>>>
