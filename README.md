@@ -39,7 +39,17 @@ Ported, with the original's semantics and invariants:
   `prompts/worker.md`, `prompts/work.md` and the tool shapes in
   `src/app/tools/main.ts`): worker tools `exec` (cwd-scoped, 30 s,
   blocked-command list), `read_file`, `write_file`, `list_dir`,
-  `report`, `ask`, `handback`, `ack`. A run with no terminal report
+  `report`, `ask`, `handback`, `ack`, plus Muse-agent patterns
+  absorbed 2026-11-03 from `~/workspace/hermes-android/
+  MUSE_AGENT_PATTERNS.md`: `memory_save` / `memory_search`,
+  `search_files`, a tool-call guardrail (identical work-tool calls
+  capped at 2 in a row, per-tool cap 20, A-B-A-B cycle detection,
+  failure budget 8), a 16k-char conversation window that drops
+  whole assistant+tool blocks only, structured tool outcomes
+  (`OK:` / `ERROR:`), a finish gate that rejects empty,
+  placeholder-PR, or no-work `ready` reports back to the model,
+  interrupt via a `STOP` file in the workdir, and a 3-tier prompt
+  (`run_worker_with_context`). A run with no terminal report
   is `failed`/`max_turns`, never a silent success. Path escapes and
   absolute paths are refused.
 - Outbox: replies the engine would send are recorded, not sent to
@@ -110,14 +120,100 @@ relying on it. The client is unit-tested on canned
 OpenAI-compatible responses, and `run-worker --model deepseek`
 exercises the real path.
 
+## Real-life use
+
+This is the layer that makes the core usable against a real
+repo (added 2026-11-03; `src/real.rs`). It does not change the
+core semantics — it adds config, persistence, a status view,
+git-worktree work, and GitHub polling via the `gh` CLI.
+
+```bash
+./target/release/dsh-superagent-rs init --dir my-agent
+# Edit my-agent/superagent.json: repo ("owner/repo"), allowed
+# GitHub logins, model (deepseek | muse-spark | bank | scripted),
+# work_root, state_file, poll interval, blocked commands.
+cd my-agent
+./target/release/dsh-superagent-rs status --state superagent-state.json
+
+# One ticket, in a worktree branch, reviewed before anything leaves:
+./target/release/dsh-superagent-rs work --config superagent.json \
+  --repo-path /path/to/repo --branch agent/typo \
+  --title "Fix typo" --prompt "Fix the typo in README.md" \
+  --model deepseek
+# --commit commits the worktree branch (only on a ready run with
+# a non-empty diff). --create-pr (needs --commit) opens a PR.
+# Nothing pushes, and nothing ever merges, on its own.
+
+# Poll GitHub issues (read-only by default):
+./target/release/dsh-superagent-rs poll --config superagent.json --once
+# --run-workers needs --repo-path and runs workers for accepted
+# tickets in worktrees. --post-replies posts only final/attention
+# outbox replies as issue comments. Add --dry-run to print the
+# gh commands instead of running them.
+# watch mode: omit --once; it polls every poll_interval_seconds.
+```
+
+How polling decides: an open issue becomes a trigger only if
+it @-mentions the agent account (resolved via `gh api user`)
+or carries the `superagent` label; anything else is skipped,
+not recorded. The existing policy gate then applies: only
+explicit requests from allowed users are accepted (the rule
+assessor accepts Explicit and ignores Inferred); unlisted
+senders are ignored. Triggers, decisions, and tickets persist
+in `superagent-state.json`, so a restart resumes instead of
+re-processing (re-polling the same issue creates nothing new).
+
+Safety defaults, stated plainly because they are the point:
+
+- Poll is dry-run unless `--run-workers` is passed.
+- Work never pushes; PR creation needs `--create-pr` on that
+  exact command, on top of `--commit`; there is no merge flag
+  anywhere in this codebase, and no auto-merge path.
+- A worktree branch that already exists is refused, so work
+  is never silently overwritten; all paths are canonicalized
+  to absolute paths before git or the worker touches them
+  (a relative-path mismatch that edited a non-git directory
+  was caught by the e2e test and is the reason for this).
+- The worker still runs only inside its worktree, with the
+  blocked-command list, the guardrail, the finish gate, and
+  the credential-arg refusal from the earlier batches.
+- `verified` on a run is advisory: it means the worker read
+  back or ran a check after its last write. A `ready` run
+  without it is still `ready` — check the diff yourself
+  before committing or opening a PR.
+
+What is still NOT real-life ready, honestly:
+
+- No Feishu adapter, no React panel (`status` is the CLI
+  replacement), no DSH sessions (the executor is a local
+  worktree subprocess host).
+- No auto-reply posting by default: outbox replies are
+  recorded in state and only posted with `--post-replies`.
+- The model legs cost real API calls (DeepSeek) or need a
+  real key (Muse Spark, still pending on Peter's device);
+  `scripted` / `bank` runs are for tests, not production.
+- Polling uses the `gh` CLI and its saved login; it does
+  not handle GitHub webhooks, and it polls on an interval
+  rather than reacting instantly.
+
+Proven 2026-11-03 on a throwaway local repo (not a real one):
+`init` → `work --model scripted --commit` produced ticket-3,
+ready, diff `README.md | 2 +-`, commit `e74d2dc` on branch
+`agent/typo`, original repo file untouched, `status` showing
+the completed ticket, invariants clean; a second run on the
+same branch was refused. A read-only `poll --once` against
+`lesterppo/dsh-superagent-rs` resolved own login `lesterppo`,
+found 0 matching issues, saved state, and posted nothing.
+
 ## Build and test
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test --offline          # 27 unit tests
+cargo test --offline          # 46 unit tests
 cargo build --release --offline
 ./target/release/dsh-superagent-rs demo
 ./target/release/dsh-superagent-rs deep-test --out deep_test_results.jsonl [--bank bank.json] [--deepseek-live]
+./target/release/dsh-superagent-rs deepseek-extensive --out deepseek_extensive_results.jsonl
 ./target/release/dsh-superagent-rs muse-spark-status
 ./target/release/dsh-superagent-rs run-worker --model muse-spark [--fallback-deepseek]
 ./target/release/dsh-superagent-rs run-worker --model interactive --bank-out muse_spark_bank.json

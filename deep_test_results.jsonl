@@ -1,8 +1,8 @@
 {"check":"D1-demo-e2e","detail":{"decisions":["accept"],"file_after":"Hello World\n","invariants":[],"scenario":"demo","ticket_id":"ticket-3","ticket_outcome":"completed","worker":{"final_state":"ready","model":"scripted","tool_calls":[["read_file","{\"path\":\"README.md\"}"],["write_file","{\"content\":\"Hello World\\n\",\"path\":\"README.md\"}"],["report","{\"state\":\"ready\",\"summary\":\"Fixed typo Wrold->World\"}"]],"turns":3}},"passed":true}
 {"check":"D1-unlisted-ignored","detail":{"decisions":1},"passed":true}
-{"check":"D2-property-seed0","detail":{"decisions":38,"ops":165,"problems":[],"tickets":8},"passed":true}
-{"check":"D2-property-seed1","detail":{"decisions":27,"ops":158,"problems":[],"tickets":5},"passed":true}
-{"check":"D2-property-seed2","detail":{"decisions":50,"ops":178,"problems":[],"tickets":6},"passed":true}
+{"check":"D2-property-seed0","detail":{"decisions":41,"ops":165,"problems":[],"tickets":10},"passed":true}
+{"check":"D2-property-seed1","detail":{"decisions":28,"ops":159,"problems":[],"tickets":5},"passed":true}
+{"check":"D2-property-seed2","detail":{"decisions":50,"ops":181,"problems":[],"tickets":7},"passed":true}
 {"check":"D3-soak-200","detail":{"decisions":200,"elapsed_ms":11,"invariants":[],"tickets":200},"passed":true}
 {"check":"D4-concurrency","detail":{"decisions":201,"invariants":[],"tickets":201},"passed":true}
 {"check":"D5a-blocked-with-question","detail":{"question":"Which API key should I use?","state":"blocked"},"passed":true}

@@ -207,7 +207,74 @@ cargo build --release --offline
   `src/main.rs` — the port.
 - `deep_test_results.jsonl` — 15/15 runtime records.
 - `deepseek_extensive_results.jsonl` — 25/25 extensive
-  DeepSeek records (workers + assessor + engine).
-- `muse_spark_bank.json` — 3 in-session Muse Spark turns.
+  DeepSeek records (workers + assessor + engine), then
+  26/27 on the 2026-11-03 rerun after the Muse-agent
+  patterns below, then 28/28 after the second self-pattern
+  batch (see next section).
+- `muse_spark_bank.json` — 3 in-session Muse Spark turns
+  (re-keyed 2026-11-03 after the toolset change; turn texts
+  identical, keys changed with the tools + system prompt).
 - `muse_spark_turns.txt` — the authored turns fed to the
   interactive run (kept for audit, not a secret).
+
+## Muse-agent patterns absorbed (2026-11-03)
+
+Source: `~/workspace/hermes-android/MUSE_AGENT_PATTERNS.md`
+(Hermes app's mapping of how the Muse agent operates; no
+published muse-agent codebase exists to diff against).
+Ported into `src/agent.rs`, unit-tested 8/8, `cargo test`
+now 35/35, demo and `deep-test` still 15/15:
+
+- ToolCallGuardrail: identical work-tool calls capped at 2
+  in a row, per-tool cap 20, A-B-A-B cycle detection,
+  failure budget 8 (numbers mirrored from the Hermes app
+  where they fit; per-tool cap loosened for server tasks).
+- ConversationWindow: 16k-char budget, whole blocks only.
+- Structured tool outcomes (`OK:` / `ERROR:`), not string
+  sniffing; `memory_save` / `memory_search` (keyword);
+  `search_files` (workdir-scoped, 50 matches max).
+- FinishGate on `ready`; interrupt via a `STOP` file;
+  3-tier prompt via `run_worker_with_context`.
+- Not ported: subagent delegation in the worker (the
+  superagent already splits orchestrator/worker), MCP, cron,
+  slash commands, semantic memory search.
+
+Live rerun of `deepseek-extensive` after the port (2026-11-03):
+**26/27**. New scenarios M1 (memory: save, recall, write —
+pass) and M2 (search: locate `compute`, fix, verify — pass)
+both pass; all 25 previous checks pass except W7, which
+failed only on an exact-byte check: the file ended up as
+`Hello World` with no trailing newline, against an expected
+`Hello World\n`. The embedded content in the other file was
+not acted on and that file stayed intact, so this is a
+strictness/variance failure, not a security failure. The
+test was left as-is rather than loosened after the fact.
+
+## Second self-pattern batch (2026-11-03, from Muse's own
+operating patterns, on Peter's clarification)
+
+- `plan` tool: worker sets a multi-step plan and marks
+  steps done; visible in `RunResult.plan_steps`.
+- Persistent worker memory: `memory_save` writes
+  `.superagent-memory.json` in the workdir, reloaded by the
+  next run there.
+- Consecutive-failure rule: 3 tool failures in a row end
+  the run as "stop and diagnose instead of retrying
+  blindly" (the total budget of 8 now only fires on
+  failures interleaved with successes).
+- `verified` flag: a `ready` claim counts as verified
+  only if the worker read back or ran a check after its
+  last write; otherwise it stays `ready` but unverified.
+- Write-without-read warning on overwriting an unread file.
+- Credential-arg refusal: surrogate-style or long `sk-`
+  values in tool arguments are refused before they can
+  be written or run.
+- Unit tests now 41/41 (6 new); demo and `deep-test`
+  still 15/15 (bank re-keyed again, turn texts identical).
+- Live rerun of `deepseek-extensive`: **28/28**. New M3
+  (plan) passes with all 3 plan steps marked done and
+  `verified: true` in 8 turns; W7 passes this run with
+  the exact file bytes and the other file intact —
+  confirming the previous W7 failure was model variance
+  in trailing-newline handling, not a guardrail or
+  security regression.

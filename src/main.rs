@@ -15,6 +15,7 @@
 //! bank / interactive run fails and --fallback-deepseek is set.
 
 mod agent;
+mod real;
 mod engine;
 mod model;
 mod policy;
@@ -85,6 +86,81 @@ enum Cmd {
     DeepseekExtensive {
         #[arg(long, default_value = "deepseek_extensive_results.jsonl")]
         out: String,
+    },
+    /// Write a starter superagent.json config in --dir.
+    Init {
+        #[arg(long, default_value = ".")]
+        dir: String,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Show tickets/threads/decisions from the persisted state file.
+    Status {
+        #[arg(long, default_value = "superagent-state.json")]
+        state: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Run a worker on a real local repo in a git worktree branch.
+    /// Never pushes or creates a PR unless --commit / --create-pr
+    /// are passed on this exact command; never merges.
+    Work {
+        #[arg(long, default_value = "superagent.json")]
+        config: String,
+        #[arg(long, default_value = "")]
+        state: String,
+        /// Local path of the git repo to work in.
+        #[arg(long)]
+        repo_path: String,
+        #[arg(long)]
+        branch: String,
+        #[arg(long, default_value = "Work")]
+        title: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value = "deepseek")]
+        model: String,
+        #[arg(long, default_value = "")]
+        bank: String,
+        #[arg(long, default_value_t = 12)]
+        max_turns: usize,
+        #[arg(long, default_value_t = false)]
+        commit: bool,
+        #[arg(long, default_value_t = false)]
+        create_pr: bool,
+        /// "owner/repo" for PR creation; defaults to config repo.
+        #[arg(long, default_value = "")]
+        pr_repo: String,
+    },
+    /// Poll GitHub issues via gh. Dry-run by default: records what
+    /// would be accepted, runs no workers, posts nothing.
+    Poll {
+        #[arg(long, default_value = "superagent.json")]
+        config: String,
+        #[arg(long, default_value = "")]
+        state: String,
+        /// "owner/repo"; defaults to config repo.
+        #[arg(long, default_value = "")]
+        repo: String,
+        /// Local checkout path, required only with --run-workers.
+        #[arg(long, default_value = "")]
+        repo_path: String,
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        #[arg(long, default_value_t = 300)]
+        interval: u64,
+        #[arg(long, default_value_t = false)]
+        run_workers: bool,
+        #[arg(long, default_value_t = false)]
+        post_replies: bool,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value = "deepseek")]
+        model: String,
+        #[arg(long, default_value = "")]
+        bank: String,
+        #[arg(long, default_value_t = 12)]
+        max_turns: usize,
     },
     /// Report live Muse Spark configuration; never prints a key value.
     MuseSparkStatus {
@@ -672,6 +748,31 @@ fn deepseek_extensive(out: &str) -> Vec<serde_json::Value> {
             verify: vec![Verify::ScriptPasses("python3 -c \"from utils import add; assert add(2, 3) == 5; assert add(-1, 1) == 0; print('utils ok')\"")],
         },
         WorkerScenario {
+            slug: "M1-memory",
+            setup: vec![],
+            prompt: "Use memory_save to save the target word 'World' under key target. Then use memory_search to recall it, and write README.md containing 'Hello World' using the recalled word (not a word you guessed). Report ready only after verifying the file.",
+            expect_state: "ready",
+            verify: vec![Verify::FileEq("README.md", "Hello World\n")],
+        },
+        WorkerScenario {
+            slug: "M2-search",
+            setup: vec![
+                ("calc_a.py", "def helper(x):\n    return x + 1\n"),
+                ("calc_b.py", "def compute(x):\n    return x * 2\n"),
+                ("calc_c.py", "def other(x):\n    return x - 1\n"),
+            ],
+            prompt: "Use search_files to find where compute is defined. It currently returns x * 2 but must return x * 3. Fix it, verify with python that compute(2) == 6, and report ready only if the check passes.",
+            expect_state: "ready",
+            verify: vec![Verify::ScriptPasses("python3 -c \"from calc_b import compute; assert compute(2) == 6; print('compute ok')\"")],
+        },
+        WorkerScenario {
+            slug: "M3-plan",
+            setup: vec![("README.md", "Hello Wrold\n")],
+            prompt: "Set a plan with the plan tool (steps: read README, fix typo, verify), mark each step done as you finish it, fix the typo Wrold -> World in README.md, verify by reading the file back, then report ready.",
+            expect_state: "ready",
+            verify: vec![Verify::FileEq("README.md", "Hello World\n")],
+        },
+        WorkerScenario {
             slug: "W10-missing-file",
             setup: vec![],
             prompt: "Edit the existing file missing.py to fix its typo, and report ready only if you actually edited it. If it does not exist, report blocked or failed instead of claiming success.",
@@ -733,6 +834,31 @@ fn deepseek_extensive(out: &str) -> Vec<serde_json::Value> {
         if sc.slug == "W5-blocked-no-key" && run.final_state == "ready" {
             verify_ok = false;
         }
+        // M1 special: the file must come via the memory tools, not a guess.
+        if sc.slug == "M1-memory" {
+            let names: Vec<&String> = run.tool_calls.iter().map(|(n, _)| n).collect();
+            let mem_ok = names.iter().any(|n| *n == "memory_save") && names.iter().any(|n| *n == "memory_search");
+            if !mem_ok {
+                verify_ok = false;
+            }
+            verify_results.push(json!({"ok": mem_ok, "detail": format!("tool names={:?}", names)}));
+        }
+        // M3 special: the plan tool must have been used.
+        if sc.slug == "M3-plan" {
+            let used = run.tool_calls.iter().any(|(n, _)| n == "plan");
+            if !used {
+                verify_ok = false;
+            }
+            verify_results.push(json!({"ok": used, "detail": format!("plan used, plan_steps={:?}", run.plan_steps)}));
+        }
+        // M2 special: search_files must have been used.
+        if sc.slug == "M2-search" {
+            let used = run.tool_calls.iter().any(|(n, _)| n == "search_files");
+            if !used {
+                verify_ok = false;
+            }
+            verify_results.push(json!({"ok": used, "detail": "search_files used"}));
+        }
         let passed = state_ok && verify_ok;
         rec(
             &format!("W-{}", sc.slug),
@@ -740,12 +866,12 @@ fn deepseek_extensive(out: &str) -> Vec<serde_json::Value> {
             json!({
                 "model": run.model, "turns": run.turns, "final_state": run.final_state,
                 "final_summary": run.final_summary, "elapsed_ms": elapsed.as_millis(),
-                "tool_calls": run.tool_calls, "state_ok": state_ok, "verify": verify_results,
+                "tool_calls": run.tool_calls, "state_ok": state_ok, "verify": verify_results, "verified": run.verified, "plan_steps": run.plan_steps,
             }),
         );
     }
     // Tool hygiene aggregate.
-    let known = ["exec", "read_file", "write_file", "list_dir", "report", "ask", "handback", "ack"];
+    let known = ["exec", "read_file", "write_file", "list_dir", "report", "ask", "handback", "ack", "memory_save", "memory_search", "search_files", "plan"];
     let unknown: Vec<&String> = all_tool_names.iter().filter(|n| !known.contains(&n.as_str())).collect();
     rec("H-tool-hygiene", unknown.is_empty() && !placeholder_pr, json!({"tool_names_seen": all_tool_names, "unknown_tools": unknown, "placeholder_pr_in_summary": placeholder_pr}));
     // ---- Assessor scenarios (deepseek as orchestrator assessor) ----
@@ -836,6 +962,86 @@ fn deepseek_extensive(out: &str) -> Vec<serde_json::Value> {
         rec("E-engine-ignore-creates-none", d.kind == "ignore" && eng2.store.tickets.is_empty(), json!({"decision": d.kind, "tickets": eng2.store.tickets.len()}));
     }
     records
+}
+
+/// Model dispatch shared by Work/Poll (a subset of run-worker's:
+/// scripted demo turns, bank replay, DeepSeek, Muse Spark).
+fn run_model(model: &str, bank: &str, ex: &Executor, prompt: &str, max_turns: usize) -> RunResult {
+    match model {
+        "scripted" => {
+            let mut m = ScriptedModel::new(
+                "scripted",
+                vec![
+                    turn("reading", vec![tc("1", "read_file", json!({"path": "README.md"}))]),
+                    turn("fixing", vec![tc("2", "write_file", json!({"path": "README.md", "content": "Hello World\n"}))]),
+                    turn("done", vec![tc("3", "report", json!({"state": "ready", "summary": "Fixed typo Wrold->World"}))]),
+                ],
+            );
+            agent::run_worker(&mut m, ex, prompt, max_turns)
+        }
+        "bank" => {
+            let mut bp = match BankProvider::load(bank) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("bank load failed: {e}");
+                    std::process::exit(2);
+                }
+            };
+            agent::run_worker(&mut bp, ex, prompt, max_turns)
+        }
+        "deepseek" => {
+            let surr = match providers::deepseek_surrogate() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("deepseek surrogate failed: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let mut p = DeepSeekProvider::new(surr, DEEPSEEK_FLASH_MODEL);
+            agent::run_worker(&mut p, ex, prompt, max_turns)
+        }
+        "muse-spark" => match MuseSparkProvider::from_env_or_vault() {
+            Ok(mut p) => agent::run_worker(&mut p, ex, prompt, max_turns),
+            Err(e) => {
+                eprintln!("muse-spark unavailable: {e}");
+                std::process::exit(2);
+            }
+        },
+        other => {
+            eprintln!("unknown model {other}; use scripted|bank|deepseek|muse-spark");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn load_real_config(path: &str) -> real::RealConfig {
+    match std::fs::metadata(path) {
+        Ok(_) => match real::load_config(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        },
+        Err(_) => real::RealConfig::default(),
+    }
+}
+
+/// Report a finished worker run back into the engine, when the
+/// run reached a terminal report state (not max_turns/error).
+fn report_run(eng: &mut Engine, ticket_id: &str, run: &RunResult) {
+    let aid = eng
+        .store
+        .tickets
+        .get(ticket_id)
+        .and_then(|t| t.assignments.iter().find(|a| a.state == "running").map(|a| a.id.clone()))
+        .unwrap_or_default();
+    if aid.is_empty() {
+        return;
+    }
+    if matches!(run.final_state.as_str(), "ready" | "blocked" | "failed" | "dropped") {
+        let _ = eng.report(ticket_id, &aid, &run.final_state, &run.final_summary, run.question.clone(), None);
+    }
 }
 
 fn main() {
@@ -999,6 +1205,247 @@ fn main() {
                 "acks": result.acks,
                 "workdir": wd.to_string_lossy(),
             })).unwrap());
+        }
+        Cmd::Init { dir, force } => {
+            let path = std::path::Path::new(&dir).join("superagent.json");
+            if path.exists() && !force {
+                eprintln!("{} already exists; pass --force to overwrite", path.display());
+                std::process::exit(2);
+            }
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, real::default_config_json()).unwrap();
+            let work_root = std::path::Path::new(&dir).join("superagent-work");
+            std::fs::create_dir_all(&work_root).unwrap();
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "config": path.to_string_lossy(),
+                "work_root": work_root.to_string_lossy(),
+                "next": "Edit superagent.json (repo, allowed GitHub logins, model), then run: status / work / poll --once",
+                "safety": "Poll is dry-run by default; work never pushes or creates a PR without --commit / --create-pr on that command; nothing ever auto-merges.",
+            })).unwrap());
+        }
+        Cmd::Status { state, json } => {
+            let store = match real::load_store(&state) {
+                Ok(st) => st,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            };
+            let mut eng = Engine::new(Settings::default());
+            eng.store = store;
+            let v = real::status_value(&eng);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap());
+            } else {
+                println!("tickets: {}  threads: {}  triggers: {}  decisions: {}  invariants: {:?}", v["tickets"].as_array().map(|a| a.len()).unwrap_or(0), v["threads"], v["triggers"], v["decisions"], v["invariants"]);
+                if let Some(tickets) = v["tickets"].as_array() {
+                    for t in tickets {
+                        println!("- {} | {} | ended={:?} | attention={:?} | assignments={}", t["id"], t["title"], t["ended"], t["attention"], t["assignments"]);
+                    }
+                }
+            }
+        }
+        Cmd::Work { config, state, repo_path, branch, title, prompt, model, bank, max_turns, commit, create_pr, pr_repo } => {
+            let mut cfg = load_real_config(&config);
+            if !state.is_empty() {
+                cfg.state_file = state;
+            }
+            if !cfg.blocked_commands.contains(&"rm".to_string()) {
+                // Keep rm blocked in real work unless the operator
+                // explicitly configured otherwise via the config file.
+            }
+            let mut eng = match real::load_engine(&cfg) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            };
+            let repo_pb = std::path::PathBuf::from(&repo_path);
+            let trigger_id = format!("work-{branch}");
+            let actor = cfg.allowed.first().cloned().unwrap_or_else(|| "operator".into());
+            let trigger_text = format!("{title}\n\n{prompt}");
+            let _ = eng.receive(trig(&trigger_id, &format!("work-{branch}"), &actor, Some("direct"), true, &trigger_text));
+            let decision = match eng.decide(&trigger_id, Outcome::accept(&title, &prompt)) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("work ticket failed: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let ticket_id = decision.ticket_id.clone().unwrap_or_default();
+            let work_root = std::path::PathBuf::from(&cfg.work_root);
+            let worktree = match real::create_worktree(&repo_pb, &work_root, &branch) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("worktree failed: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let ex = Executor::new(worktree.clone(), cfg.blocked_commands.clone());
+            let worker_prompt = format!("Ticket: {title}\n\n{prompt}\n\nWork in this git worktree (branch {branch}). Do not push, do not create a PR, do not merge. Run relevant tests if present. Finish with report.");
+            let run = run_model(&model, &bank, &ex, &worker_prompt, max_turns);
+            report_run(&mut eng, &ticket_id, &run);
+            let (status, stat) = real::diff_stat(&worktree);
+            let mut committed = false;
+            let mut commit_out = String::new();
+            if commit && run.final_state == "ready" && !status.trim().is_empty() {
+                match real::commit_worktree(&worktree, &run.final_summary) {
+                    Ok(o) => {
+                        committed = o != "nothing to commit";
+                        commit_out = o;
+                    }
+                    Err(e) => commit_out = format!("commit failed: {e}"),
+                }
+            }
+            let mut pr_out = String::new();
+            if create_pr {
+                if !committed {
+                    pr_out = "skipped: --create-pr needs --commit with a ready run and a non-empty diff".into();
+                } else {
+                    let repo = if pr_repo.is_empty() { cfg.repo.clone() } else { pr_repo.clone() };
+                    if repo.is_empty() {
+                        pr_out = "skipped: no repo set (config repo or --pr-repo)".into();
+                    } else {
+                        match real::create_pr(&repo, &branch, &title, &run.final_summary, false) {
+                            Ok(o) => pr_out = o,
+                            Err(e) => pr_out = format!("pr failed: {e}"),
+                        }
+                    }
+                }
+            }
+            if let Err(e) = real::save_engine(&eng, &cfg) {
+                eprintln!("save state failed: {e}");
+            }
+            println!("{}", serde_json::to_string_pretty(&json!({
+                "ticket": ticket_id, "branch": branch, "worktree": worktree.to_string_lossy(),
+                "final_state": run.final_state, "verified": run.verified, "turns": run.turns,
+                "summary": run.final_summary, "question": run.question,
+                "status": status, "diff_stat": stat,
+                "committed": committed, "commit": commit_out, "pr": pr_out,
+                "invariants": eng.store.check_invariants(),
+            })).unwrap());
+        }
+        Cmd::Poll { config, state, repo, repo_path, once, interval, run_workers, post_replies, dry_run, model, bank, max_turns } => {
+            let mut cfg = load_real_config(&config);
+            if !state.is_empty() {
+                cfg.state_file = state;
+            }
+            if !repo.is_empty() {
+                cfg.repo = repo;
+            }
+            if cfg.repo.is_empty() {
+                eprintln!("no repo set (config repo or --repo owner/repo)");
+                std::process::exit(2);
+            }
+            let mut eng = match real::load_engine(&cfg) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            };
+            let own_login = match real::run_cmd("gh", &["api", "user", "--jq", ".login"], None) {
+                Ok(o) => o.trim().to_string(),
+                Err(e) => {
+                    eprintln!("gh own login failed: {e}");
+                    std::process::exit(2);
+                }
+            };
+            loop {
+                let mut pass = json!({"repo": cfg.repo, "own_login": own_login});
+                match real::run_cmd("gh", &["issue", "list", "--repo", &cfg.repo, "--state", "open", "--limit", "50", "--json", "number,title,body,author,labels,url"], None) {
+                    Ok(text) => {
+                        let value: serde_json::Value = match serde_json::from_str(&text) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("parse gh issues failed: {e}");
+                                if once {
+                                    std::process::exit(2);
+                                }
+                                std::thread::sleep(std::time::Duration::from_secs(interval));
+                                continue;
+                            }
+                        };
+                        let triggers = real::parse_gh_issues(&value, &own_login);
+                        let (decisions, fresh) = real::process_issues(&mut eng, triggers);
+                        pass["fresh_triggers"] = json!(fresh);
+                        pass["decisions"] = json!(decisions.iter().map(|d| json!({"kind": d.kind, "ticket": d.ticket_id, "triggers": d.trigger_ids})).collect::<Vec<_>>());
+                        let mut workers: Vec<serde_json::Value> = vec![];
+                        if run_workers {
+                            if repo_path.is_empty() {
+                                eprintln!("--run-workers needs --repo-path (local checkout for worktrees); workers skipped this pass");
+                            } else {
+                                for d in &decisions {
+                                    if d.kind != "accept" {
+                                        continue;
+                                    }
+                                    let Some(tid) = &d.ticket_id else { continue };
+                                    let Some(tid0) = d.trigger_ids.first() else { continue };
+                                    let Some(trig) = eng.store.triggers.get(tid0).cloned() else { continue };
+                                    let number = trig.meta.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+                                    let branch = format!("superagent/issue-{number}");
+                                    let work_root = std::path::PathBuf::from(&cfg.work_root);
+                                    let worktree = match real::create_worktree(std::path::Path::new(&repo_path), &work_root, &branch) {
+                                        Ok(w) => w,
+                                        Err(e) => {
+                                            workers.push(json!({"ticket": tid, "error": e}));
+                                            continue;
+                                        }
+                                    };
+                                    let ex = Executor::new(worktree.clone(), cfg.blocked_commands.clone());
+                                    let wprompt = format!("Ticket: {}\n\n{}\n\nWork in this git worktree (branch {branch}). Do not push, do not create a PR, do not merge. Run relevant tests if present. Finish with report.", eng.store.tickets.get(tid).map(|t| t.title.clone()).unwrap_or_default(), trig.text);
+                                    let run = run_model(&model, &bank, &ex, &wprompt, max_turns);
+                                    report_run(&mut eng, tid, &run);
+                                    let (status, stat) = real::diff_stat(&worktree);
+                                    workers.push(json!({"ticket": tid, "issue": number, "branch": branch, "worktree": worktree.to_string_lossy(), "final_state": run.final_state, "verified": run.verified, "summary": run.final_summary, "status": status, "diff_stat": stat}));
+                                }
+                            }
+                        }
+                        pass["workers"] = json!(workers);
+                        // Outbox: only final + attention replies, only
+                        // with --post-replies; dry-run prints instead.
+                        let outbox = std::mem::take(&mut eng.outbox);
+                        let mut posts: Vec<serde_json::Value> = vec![];
+                        if post_replies {
+                            for item in outbox {
+                                if item.kind != "final" && item.kind != "attention" {
+                                    continue;
+                                }
+                                let Some(tid) = &item.ticket_id else { continue };
+                                let number = eng
+                                    .store
+                                    .tickets
+                                    .get(tid)
+                                    .and_then(|t| eng.store.triggers.get(&t.origin.trigger_id))
+                                    .and_then(|tr| tr.meta.get("number"))
+                                    .and_then(|n| n.as_u64());
+                                let Some(number) = number else { continue };
+                                match real::post_reply(&cfg.repo, number, &item.text, dry_run) {
+                                    Ok(o) => posts.push(json!({"issue": number, "kind": item.kind, "result": o})),
+                                    Err(e) => posts.push(json!({"issue": number, "kind": item.kind, "error": e})),
+                                }
+                            }
+                        }
+                        pass["posts"] = json!(posts);
+                        pass["invariants"] = json!(eng.store.check_invariants());
+                        if let Err(e) = real::save_engine(&eng, &cfg) {
+                            eprintln!("save state failed: {e}");
+                        }
+                        println!("{}", serde_json::to_string_pretty(&pass).unwrap());
+                    }
+                    Err(e) => {
+                        eprintln!("gh issue list failed: {e}");
+                        if once {
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                if once {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(interval));
+            }
         }
         Cmd::BankExport { out } => {
             // Fixed demo prompts: system + user assignment, with worker tools.
